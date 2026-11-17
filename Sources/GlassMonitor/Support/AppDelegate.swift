@@ -1,0 +1,227 @@
+import AppKit
+import SwiftUI
+import Combine
+import ServiceManagement
+import Core
+
+/// Menu bar presence built on NSStatusItem so the readout refreshes on every
+/// sample (SwiftUI's MenuBarExtra label does not), with an NSPopover hosting the
+/// Liquid Glass panel. Left click toggles the panel, right click offers the
+/// display-combination menu directly on the icon.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let monitor = HardwareMonitor()
+    let settings = AppSettings()
+
+    private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private var cancellables: Set<AnyCancellable> = []
+
+    private var panelWidth: CGFloat { Panel.cardWidth * 2 + Panel.spacing * 3 }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--selftest-loginitem") {
+            runLoginItemSelfTest()
+            return
+        }
+        SelfShot.runIfRequested(monitor: monitor, settings: settings)
+        NSApp.setActivationPolicy(.accessory)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(handleClick(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.imageHugsTitle = true
+        }
+
+        popover.behavior = .transient
+        popover.animates = true
+        let maxHeight = (NSScreen.main?.visibleFrame.height ?? 900) - 24
+        let host = NSHostingController(rootView: RootView(maxHeight: maxHeight, onHeight: { [weak self] height in
+            guard let self else { return }
+            self.popover.contentSize = NSSize(width: self.panelWidth, height: height)
+        })
+        .environmentObject(monitor)
+        .environmentObject(settings)
+        .frame(width: panelWidth))
+        popover.contentViewController = host
+        popover.contentSize = NSSize(width: panelWidth, height: 640)
+
+        monitor.$snapshot
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshLabel() }
+            .store(in: &cancellables)
+        settings.$menuBarItems
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.refreshLabel()
+                self?.reanchorPopover()
+            }
+            .store(in: &cancellables)
+        settings.$selectedGPU
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshLabel() }
+            .store(in: &cancellables)
+        settings.$interval
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] interval in self?.monitor.updateInterval(interval) }
+            .store(in: &cancellables)
+
+        refreshLabel()
+        monitor.start(interval: settings.interval)
+
+        if CommandLine.arguments.contains("--selfpopover") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                guard let self, let button = self.statusItem.button else { return }
+                self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            }
+        }
+    }
+
+    /// One glyph per hardware domain followed by its selected readouts (temp
+    /// in °C, load in %), drawn into a single image so one status item shows
+    /// icon-labelled groups. Colors resolve inside the drawing handler so
+    /// dark/light menu bars and wallpaper tinting stay correct without
+    /// rebuilding on appearance changes.
+    private func refreshLabel() {
+        guard let button = statusItem.button else { return }
+        var snapshot = monitor.snapshot
+        if let selected = settings.selectedGPU,
+           let gpu = snapshot.gpus.first(where: { $0.id == selected }) {
+            snapshot.gpu = gpu
+        }
+        let groups = MenuBarItem.Domain.allCases.compactMap { domain -> (symbol: String, text: String)? in
+            let texts = MenuBarItem.allCases
+                .filter { $0.domain == domain && settings.menuBarItems.contains($0) }
+                .map { $0.text(snapshot) }
+            guard !texts.isEmpty else { return nil }
+            return (domain.symbol, texts.joined(separator: " "))
+        }
+        button.title = ""
+        button.imagePosition = .imageOnly
+
+        guard !groups.isEmpty else {
+            let configuration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            button.image = NSImage(systemSymbolName: "gauge.medium", accessibilityDescription: "玻璃监控")?
+                .withSymbolConfiguration(configuration)
+            button.image?.isTemplate = true
+            return
+        }
+
+        let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .medium)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+        let iconTextGap: CGFloat = 3
+        let segmentGap: CGFloat = 8
+        let texts = groups.map(\.text)
+
+        var widths: [CGFloat] = []
+        var glyphWidths: [CGFloat] = []
+        var total: CGFloat = 0
+        for (index, group) in groups.enumerated() {
+            let glyph = NSImage(systemSymbolName: group.symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(symbolConfiguration)
+            let glyphWidth = glyph?.size.width ?? 0
+            let textWidth = ceil((texts[index] as NSString).size(withAttributes: attributes).width)
+            glyphWidths.append(glyphWidth)
+            widths.append(glyphWidth + iconTextGap + textWidth)
+            total += glyphWidth + iconTextGap + textWidth
+        }
+        total += segmentGap * CGFloat(groups.count - 1)
+        let height: CGFloat = 22
+
+        let image = NSImage(size: NSSize(width: ceil(total), height: height), flipped: false) { rect in
+            let color = NSColor.labelColor
+            let tinted = NSImage.SymbolConfiguration(paletteColors: [color])
+            var x = rect.minX
+            for (index, group) in groups.enumerated() {
+                if let glyph = NSImage(systemSymbolName: group.symbol, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(symbolConfiguration)?
+                    .withSymbolConfiguration(tinted) {
+                    let size = glyph.size
+                    glyph.draw(in: NSRect(x: x, y: (rect.height - size.height) / 2,
+                                          width: size.width, height: size.height))
+                }
+                let text = texts[index] as NSString
+                let textSize = text.size(withAttributes: [.font: font, .foregroundColor: color])
+                text.draw(at: NSPoint(x: x + glyphWidths[index] + iconTextGap,
+                                      y: (rect.height - textSize.height) / 2),
+                          withAttributes: [.font: font, .foregroundColor: color])
+                x += widths[index] + segmentGap
+            }
+            return true
+        }
+        image.isTemplate = false
+        button.image = image
+    }
+
+    /// Registers then immediately unregisters the login item, printing each
+    /// status so the SMAppService path can be verified without leaving a
+    /// persistent change behind.
+    private func runLoginItemSelfTest() {
+        let service = SMAppService.mainApp
+        print("status before: \(service.status.rawValue)")
+        do {
+            try service.register()
+            print("register ok, status: \(service.status.rawValue)")
+            try service.unregister()
+            print("unregister ok, status: \(service.status.rawValue)")
+        } catch {
+            print("selftest error: \(error)")
+        }
+        NSApp.terminate(nil)
+    }
+
+    /// Adding or removing a readout changes the item's width; re-anchor so the
+    /// popover arrow keeps pointing at the glyph instead of stale coordinates.
+    private func reanchorPopover() {
+        guard popover.isShown, let button = statusItem.button else { return }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    @objc private func handleClick(_ sender: Any?) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showModeMenu()
+            return
+        }
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    private func showModeMenu() {
+        let menu = NSMenu()
+        for item in MenuBarItem.allCases {
+            let entry = NSMenuItem(title: item.title, action: #selector(toggleItem(_:)), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = item.rawValue
+            entry.state = settings.menuBarItems.contains(item) ? .on : .off
+            menu.addItem(entry)
+        }
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出玻璃监控", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        if let button = statusItem.button {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 6), in: button)
+        }
+    }
+
+    @objc private func toggleItem(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let item = MenuBarItem(rawValue: raw) else { return }
+        if settings.menuBarItems.contains(item) {
+            settings.menuBarItems.remove(item)
+        } else {
+            settings.menuBarItems.insert(item)
+        }
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}

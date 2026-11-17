@@ -1,0 +1,84 @@
+import SwiftUI
+import Core
+
+struct CPUCard: View {
+    let snapshot: SystemSnapshot
+    let history: [Double]
+    var tempHistory: [Double] = []
+    var showsPerCore: Bool
+
+    private var cores: [CoreLoad] { snapshot.cpu.cores }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            CardHeader(title: DeviceInfo.shared.shortCPUName, systemImage: "cpu", tint: Accent.cpu)
+
+            HStack(alignment: .center, spacing: 10) {
+                UsageRing(percent: snapshot.cpu.totalUsage, color: Accent.cpu,
+                          label: "\(Num.percent(snapshot.cpu.totalUsage))%")
+                    .frame(width: 56, height: 56)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    MetricRow(label: "温度", value: Num.celsius(snapshot.cpuTemperature))
+                    MetricRow(label: "最忙核心",
+                              value: "\(Num.percent(cores.map(\.usage).max() ?? 0))%")
+                    MetricRow(label: "风扇", value: coolerText)
+                }
+                Spacer(minLength: 0)
+            }
+
+            if showsPerCore, !cores.isEmpty {
+                CoreBars(cores: cores, color: Accent.cpu)
+                    .frame(height: 20)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    MiniLegend(color: Accent.cpu,
+                               text: "占用 \(Num.percent(snapshot.cpu.totalUsage))%")
+                    MiniLegend(color: Accent.thermal,
+                               text: "温度 \(Num.degrees(snapshot.cpuTemperature))")
+                    Spacer(minLength: 4)
+                    Text(Num.frequencyRange(base: snapshot.cpu.frequencyGHz, ceiling: snapshot.cpu.turboGHz))
+                        .font(.mono(9))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                DualSparkline(usage: history, temperature: tempHistory, usageColor: Accent.cpu)
+                    .frame(height: 30)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        }
+        .glassCard(Accent.cpu)
+    }
+
+    private var coolerText: String {
+        guard let fan = snapshot.coolerFan else { return "—" }
+        let rpm = fan.currentRPM ?? 0
+        return rpm > 0 ? "\(Int(rpm.rounded())) RPM" : "停转"
+    }
+}
+
+/// One bar per logical processor — the quickest way to spot a single busy
+/// thread that the aggregate percentage hides.
+struct CoreBars: View {
+    let cores: [CoreLoad]
+    let color: Color
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 2) {
+            ForEach(cores) { core in
+                GeometryReader { proxy in
+                    ZStack(alignment: .bottom) {
+                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                            .fill(color.opacity(0.16))
+                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                            .fill(color.opacity(0.35 + core.usage / 100 * 0.65))
+                            .frame(height: max(1.5, proxy.size.height * CGFloat(min(core.usage, 100) / 100)))
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+}
