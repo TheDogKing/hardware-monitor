@@ -8,6 +8,7 @@ Package.resolved
 
 # App bundle produced by Scripts/build.sh
 build/
+dist/
 
 # Editors
 .vscode/
