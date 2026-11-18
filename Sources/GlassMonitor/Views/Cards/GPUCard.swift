@@ -47,7 +47,7 @@ struct GPUCard: View {
                         MiniLegend(color: Accent.thermal,
                                    text: "温度 \(Num.degrees(gpu.temperatureC))")
                         Spacer(minLength: 6)
-                        Text(Num.megahertz(gpu.coreClockMHz))
+                        Text(clockText)
                             .font(.mono(9))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -95,8 +95,19 @@ struct GPUCard: View {
     }
 
     private var fanText: String {
+        if gpu.isIntegrated { return "共享散热" }
         guard let rpm = gpu.fanRPM else { return "—" }
         return rpm > 0 ? "\(Int(rpm.rounded())) RPM" : "停转"
+    }
+
+    private var clockText: String {
+        if let clock = gpu.coreClockMHz {
+            return Num.megahertz(clock)
+        }
+        if gpu.isIntegrated {
+            return "动态调频"
+        }
+        return "—"
     }
 
     private var vramFraction: Double {

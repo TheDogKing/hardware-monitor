@@ -89,12 +89,22 @@ public final class HardwareMonitor: ObservableObject {
         next.memory = memory.read()
         next.network = network.read()
         next.gpus = gpu.readAll()
-        next.gpu = next.gpus[0]
         next.fans = fans.read()
         next.temperatures = temperatures.read()
         next.cpu.temperatureC = next.cpuTemperature
-        if next.gpu.temperatureC == nil { next.gpu.temperatureC = temperatures.gpuTemperature }
-        next.gpus[0] = next.gpu
+
+        for i in 0..<next.gpus.count {
+            if next.gpus[i].temperatureC == nil {
+                if next.gpus[i].isIntegrated || next.gpus[i].vendor == "Intel" {
+                    next.gpus[i].temperatureC = next.cpu.temperatureC ?? next.cpuTemperature
+                } else {
+                    next.gpus[i].temperatureC = temperatures.gpuTemperature
+                }
+            }
+        }
+        if !next.gpus.isEmpty {
+            next.gpu = next.gpus[0]
+        }
 
         let download = next.network.downloadBps
         let upload = next.network.uploadBps

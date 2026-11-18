@@ -62,9 +62,18 @@ public final class GPUSampler {
             snapshot.id = identity.id
             snapshot.name = identity.name
             snapshot.vendor = identity.vendor
+            snapshot.isIntegrated = identity.isIntegrated
 
-            snapshot.utilization = number(statistics["Device Utilization %"])
+            let mainUtil = number(statistics["Device Utilization %"])
                 ?? number(statistics["GPU Activity(%)"])
+            let unitUtils = (0...3).compactMap { number(statistics["Device Unit \($0) Utilization %"]) }
+            let maxUnit = unitUtils.max()
+            if let mainUtil, let maxUnit {
+                snapshot.utilization = max(mainUtil, maxUnit)
+            } else {
+                snapshot.utilization = mainUtil ?? maxUnit
+            }
+
             snapshot.temperatureC = number(statistics["Temperature(C)"])
             snapshot.powerW = number(statistics["Total Power(W)"])
             snapshot.coreClockMHz = number(statistics["Core Clock(MHz)"])
@@ -81,8 +90,60 @@ public final class GPUSampler {
                 snapshot.vramUsedBytes = used
                 snapshot.vramCachedBytes = cached
                 snapshot.vramFreeBytes = free
-                snapshot.vramTotalBytes = used + cached + free
-                snapshot.memoryUtilization = used / (used + cached + free) * 100
+                let total = used + cached + free
+                snapshot.vramTotalBytes = total
+                snapshot.memoryUtilization = total > 0 ? (used / total) * 100 : 0
+            } else {
+                // Integrated GPU (Intel UHD/HD or unified memory)
+                let sysUsed = number(statistics["inUseSysMemoryBytes"])
+                    ?? number(statistics["gartUsedBytes"])
+                    ?? 0
+                let sysCached = number(statistics["orphanedReusableSysMemoryBytes"]) ?? 0
+
+                let totalMB = number(dictionary["VRAM,totalMB"])
+                    ?? number(property(service, "VRAM,totalMB"))
+                    ?? identity.vramTotalMB
+
+                if let totalMB, totalMB > 0 {
+                    let totalBytes = totalMB * 1024 * 1024
+                    snapshot.vramTotalBytes = totalBytes
+                    snapshot.vramUsedBytes = sysUsed
+                    snapshot.vramCachedBytes = sysCached
+                    snapshot.vramFreeBytes = max(0, totalBytes - sysUsed)
+                    snapshot.memoryUtilization = totalBytes > 0 ? (sysUsed / totalBytes * 100) : 0
+                } else if let gartTotal = number(statistics["gartSizeBytes"]), gartTotal > 0 {
+                    snapshot.vramTotalBytes = gartTotal
+                    snapshot.vramUsedBytes = sysUsed
+                    snapshot.vramCachedBytes = sysCached
+                    snapshot.vramFreeBytes = max(0, gartTotal - sysUsed)
+                    snapshot.memoryUtilization = (sysUsed / gartTotal) * 100
+                } else if sysUsed > 0 {
+                    snapshot.vramUsedBytes = sysUsed
+                }
+            }
+
+            // Fallback telemetry from AppleSMC for integrated GPUs or drivers without IORegistry stats
+            if snapshot.isIntegrated || snapshot.vendor == "Intel" {
+                _ = SMCClient.shared.open()
+                // Power: Intel Processor Graphics Core (PCGC) or Measured (PCGM)
+                if snapshot.powerW == nil {
+                    if let power = SMCClient.shared.read("PCGC")?.number, power >= 0 {
+                        snapshot.powerW = power
+                    } else if let power = SMCClient.shared.read("PCGM")?.number, power >= 0 {
+                        snapshot.powerW = power
+                    }
+                }
+                // Temperature: Intel iGPU shares thermal package with CPU die.
+                // Check TC0G first (dedicated iGPU sensor), then TC0P (package) or TC0D (die).
+                if snapshot.temperatureC == nil {
+                    if let igpuTemp = SMCClient.shared.read("TC0G")?.number, igpuTemp >= 20, igpuTemp <= 120 {
+                        snapshot.temperatureC = igpuTemp
+                    } else if let pkgTemp = SMCClient.shared.read("TC0P")?.number, pkgTemp >= 20, pkgTemp <= 120 {
+                        snapshot.temperatureC = pkgTemp
+                    } else if let dieTemp = SMCClient.shared.read("TC0D")?.number, dieTemp >= 20, dieTemp <= 120 {
+                        snapshot.temperatureC = dieTemp
+                    }
+                }
             }
 
             snapshot.isSupported = true
@@ -95,7 +156,7 @@ public final class GPUSampler {
     /// ties, so an enabled iGPU never displaces the card that is actually
     /// driving the display.
     private static func priority(_ gpu: GPUSnapshot) -> Int {
-        var score = gpu.vendor == "Intel" ? 0 : 2
+        var score = (gpu.isIntegrated || gpu.vendor == "Intel") ? 0 : 2
         if gpu.temperatureC != nil { score += 1 }
         if gpu.fanRPM != nil { score += 1 }
         if gpu.vramTotalBytes != nil { score += 1 }
@@ -108,7 +169,7 @@ public final class GPUSampler {
     /// does. PCI class `03.00.00` marks a display controller. The registry
     /// entry ID of that parent identifies the device across samples.
     private static func deviceIdentity(for service: io_registry_entry_t)
-        -> (id: String, name: String, vendor: String?) {
+        -> (id: String, name: String, vendor: String?, vramTotalMB: Double?, isIntegrated: Bool) {
         var serviceID: UInt64 = 0
         IORegistryEntryGetRegistryEntryID(service, &serviceID)
         let fallbackID = "gpu-\(serviceID)"
@@ -120,7 +181,7 @@ public final class GPUSampler {
         for _ in 0..<10 {
             var parent: io_registry_entry_t = 0
             guard IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent) == kIOReturnSuccess,
-                  parent != 0 else { return (fallbackID, "GPU", nil) }
+                  parent != 0 else { return (fallbackID, "GPU", nil, nil, false) }
             IOObjectRelease(entry)
             entry = parent
 
@@ -134,14 +195,29 @@ public final class GPUSampler {
             IORegistryEntryGetRegistryEntryID(entry, &registryID)
             let id = "gpu-\(registryID)"
             let vendor = vendorName(property(entry, "vendor-id"))
-            if let string = property(entry, "model") as? String { return (id, string, vendor) }
-            if let data = property(entry, "model") as? Data,
+            let totalMB = number(property(entry, "VRAM,totalMB"))
+                ?? number(property(entry, "VRAM,totalsize"))
+            let hasPlatformID = property(entry, "AAPL,ig-platform-id") != nil
+                || property(service, "AAPL,ig-platform-id") != nil
+
+            var modelName: String?
+            if let string = property(entry, "model") as? String {
+                modelName = string
+            } else if let data = property(entry, "model") as? Data,
                let decoded = String(data: data, encoding: .ascii), !decoded.isEmpty {
-                return (id, decoded, vendor)
+                modelName = decoded.trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
             }
-            return (id, "GPU", vendor)
+            let name = modelName ?? "GPU"
+            let isIntegrated = vendor == "Intel"
+                || hasPlatformID
+                || name.contains("Intel")
+                || name.contains("UHD")
+                || name.contains("HD Graphics")
+                || name.contains("Iris")
+
+            return (id, name, vendor, totalMB, isIntegrated)
         }
-        return (fallbackID, "GPU", nil)
+        return (fallbackID, "GPU", nil, nil, false)
     }
 
     private static func vendorName(_ value: Any?) -> String? {
@@ -203,6 +279,15 @@ public final class GPUSampler {
     private static func number(_ value: Any?) -> Double? {
         if let number = value as? NSNumber { return Double(truncating: number) }
         if let string = value as? String, let parsed = Double(string) { return parsed }
+        if let data = value as? Data {
+            if data.count == 4 {
+                let val = data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+                return Double(val)
+            } else if data.count == 8 {
+                let val = data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+                return Double(val)
+            }
+        }
         return nil
     }
 }

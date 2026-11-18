@@ -46,6 +46,7 @@ public struct GPUSnapshot: Identifiable {
     public var vramUsedBytes: Double?
     public var vramCachedBytes: Double?
     public var vramFreeBytes: Double?
+    public var isIntegrated = false
     public var isSupported = false
 
     public init() {}

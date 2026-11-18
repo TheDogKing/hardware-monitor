@@ -51,5 +51,6 @@ if [[ -f Resources/AppIcon.png ]]; then
   rm -rf "$ICONDIR"
 fi
 
+xattr -cr "$APP"
 codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1
 echo "built $APP"

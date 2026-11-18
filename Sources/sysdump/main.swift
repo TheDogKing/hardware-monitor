@@ -21,6 +21,7 @@ print("hackintosh   : \(info.isHackintosh)")
 SMCClient.shared.open()
 print("smc available  : \(SMCClient.shared.isAvailable)   keys: \(SMCClient.shared.keyCount)")
 
+
 let cpu = CPUSampler()
 let memory = MemorySampler()
 let network = NetworkSampler()
@@ -38,7 +39,7 @@ var netSnap = NetworkSnapshot()
 for tick in 1...3 {
     Thread.sleep(forTimeInterval: 1.0)
     cpuSnap = cpu.read()
-    gpuSnap = gpu.read()
+    let gpus = gpu.readAll()
     netSnap = network.read()
 
     print("""
@@ -47,12 +48,16 @@ for tick in 1...3 {
       cpu  total=\(f1(cpuSnap.totalUsage))%  user=\(f1(cpuSnap.user))%  sys=\(f1(cpuSnap.system))%  \
     freq=\(optional(cpuSnap.frequencyGHz, f2, suffix: "GHz"))  temp=\(optional(cpuSnap.temperatureC, f1, suffix: "C"))
       cores [\(cpuSnap.cores.count)]: \(cpuSnap.cores.map { f0($0.usage) }.joined(separator: " "))
-      gpu  name=\(gpuSnap.name)  supported=\(gpuSnap.isSupported)
-           util=\(optional(gpuSnap.utilization))%  temp=\(optional(gpuSnap.temperatureC))C  power=\(optional(gpuSnap.powerW))W  \
-    core=\(optional(gpuSnap.coreClockMHz, f0))MHz  mem=\(optional(gpuSnap.memoryClockMHz, f0))MHz
-           vram used=\(gpuSnap.vramUsedBytes.map { ByteFormat.string($0) } ?? "-")  cached=\(gpuSnap.vramCachedBytes.map { ByteFormat.string($0) } ?? "-")  free=\(gpuSnap.vramFreeBytes.map { ByteFormat.string($0) } ?? "-")  total=\(gpuSnap.vramTotalBytes.map { ByteFormat.string($0) } ?? "-")
-      net  down=\(ByteFormat.bitsPerSecond(netSnap.downloadBps))  up=\(ByteFormat.bitsPerSecond(netSnap.uploadBps))  iface=\(netSnap.activeInterface ?? "-")
     """)
+    for (i, gpuSnap) in gpus.enumerated() {
+        print("""
+      gpu[\(i)] id=\(gpuSnap.id) name=\(gpuSnap.displayName) vendor=\(gpuSnap.vendor ?? "-") supported=\(gpuSnap.isSupported)
+            util=\(optional(gpuSnap.utilization))%  temp=\(optional(gpuSnap.temperatureC))C  power=\(optional(gpuSnap.powerW))W  \
+    core=\(optional(gpuSnap.coreClockMHz, f0))MHz  mem=\(optional(gpuSnap.memoryClockMHz, f0))MHz  fanRPM=\(optional(gpuSnap.fanRPM, f0))
+            vram used=\(gpuSnap.vramUsedBytes.map { ByteFormat.string($0) } ?? "-")  cached=\(gpuSnap.vramCachedBytes.map { ByteFormat.string($0) } ?? "-")  free=\(gpuSnap.vramFreeBytes.map { ByteFormat.string($0) } ?? "-")  total=\(gpuSnap.vramTotalBytes.map { ByteFormat.string($0) } ?? "-")
+    """)
+    }
+    print("      net  down=\(ByteFormat.bitsPerSecond(netSnap.downloadBps))  up=\(ByteFormat.bitsPerSecond(netSnap.uploadBps))  iface=\(netSnap.activeInterface ?? "-")")
 }
 
 let mem = memory.read()
